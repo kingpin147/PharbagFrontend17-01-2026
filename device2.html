@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="en">
+    <head>
+        <script src="https://unpkg.com/peerjs@1.5.0/dist/peerjs.min.js"></script>
+        <meta charset="utf-8">
+            <title>
+                WebRTC Data Channel Offer Receiver
+            </title>
+        </meta>
+    </head>
+    <body>
+        <h1>
+            WebRTC Data Channel Offer Receiver
+        </h1>
+        <textarea id="offerTextarea" placeholder="Paste Offer SDP here">
+        </textarea>
+        <button id="setOfferButton">
+            Set Offer
+        </button>
+        <button id="connectButton">
+            Connect
+        </button>
+        <textarea id="receivedData" placeholder="Received data will appear here" readonly="">
+        </textarea>
+        <script>
+            const offerTextarea = document.getElementById('offerTextarea');
+        const setOfferButton = document.getElementById('setOfferButton');
+        const connectButton = document.getElementById('connectButton');
+        const receivedDataTextarea = document.getElementById('receivedData');
+        let peerConnection;
+        let dataChannel;
+var peer = new Peer();
+console.log(peer)
+peer.on('open', function(id) {
+    console.log('My peer ID is: ' + id);
+  });
+        setOfferButton.addEventListener('click', async () => {
+            const offerSdp = offerTextarea.value;
+
+            try {
+                const configuration = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' },{
+        urls: "turn:65.2.38.131:3478",
+        username: "somen007",
+        credential: "somen007",
+      },] };
+                peerConnection = new RTCPeerConnection(configuration);
+
+                // Set up data channel event handlers
+                peerConnection.ondatachannel = event => {
+                    dataChannel = event.channel;
+
+                    dataChannel.onopen = () => console.log('Data channel is open');
+                    dataChannel.onclose = () => console.log('Data channel is closed');
+                    dataChannel.onmessage = event => {
+                        receivedDataTextarea.value += event.data + '\n';
+                    };
+                };
+
+                // Set the remote Offer SDP
+                await peerConnection.setRemoteDescription({ type: 'offer', sdp: offerSdp });
+
+                console.log('Offer SDP set successfully.');
+
+                setOfferButton.disabled = true;
+                connectButton.disabled = false;
+            } catch (error) {
+                console.error('Error setting Offer SDP:', error);
+            }
+        });
+
+        connectButton.addEventListener('click', async () => {
+            try {
+                // Create an Answer SDP
+                const answer = await peerConnection.createAnswer();
+                await peerConnection.setLocalDescription(answer);
+
+                // You can send the answer SDP to Device 1 via a signaling mechanism (not included in this example).
+                // After Device 1 receives the answer, it should set the answer SDP using setRemoteDescription.
+
+                console.log('Answer SDP generated. You can now complete the connection.');
+
+                connectButton.disabled = true;
+            } catch (error) {
+                console.error('Error generating Answer:', error);
+            }
+        });
+        </script>
+    </body>
+</html>

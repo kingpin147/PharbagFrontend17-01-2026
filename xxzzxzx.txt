@@ -1,0 +1,70 @@
+finaly working again
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Multiple File Upload and JSON List Upload Demo</title>
+</head>
+<body>
+    <h1>Multiple File Upload and JSON List Upload Demo</h1>
+
+    <!-- Multiple File Upload Form -->
+    <h2>Upload Multiple Files</h2>
+    <form id="fileUploadForm" enctype="multipart/form-data">
+        <input type="file" name="files" id="fileInput" multiple>
+        <button type="submit">Upload Files</button>
+    </form>
+
+    <!-- JSON List Upload Form -->
+    <h2>Upload JSON List</h2>
+    <textarea id="jsonInput" rows="4" cols="50" placeholder="Enter JSON URLs, one per line"></textarea>
+    <button id="uploadJsonButton">Upload JSON</button>
+
+    <!-- Response Display -->
+    <h2>Response</h2>
+    <pre id="response"></pre>
+
+    <script>
+        // Function to handle multiple file upload
+        document.getElementById("fileUploadForm").addEventListener("submit", async function (e) {
+            e.preventDefault();
+
+            const formData = new FormData();
+            const files = document.getElementById("fileInput").files;
+
+            for (const file of files) {
+                formData.append("files", file);
+            }
+
+            const response = await fetch("https://<?php echo $_GET['url'];?>.ngrok.io/uploadfiles/", {
+                method: "POST",
+                body: formData,
+            });
+
+            const data = await response.json();
+            document.getElementById("response").textContent = JSON.stringify(data, null, 2);
+        });
+
+        // Function to handle JSON list upload
+        document.getElementById("uploadJsonButton").addEventListener("click", async function () {
+            const jsonInput = document.getElementById("jsonInput").value;
+            const jsonUrls = jsonInput.split('\n').map(url => url.trim());
+
+            try {
+                const response = await fetch("https://<?php echo $_GET['url'];?>.ngrok.io/uploadjson/", {
+                    method: "POST",
+                    headers: {
+                        "Content-Type": "application/json",
+                    },
+                    body: JSON.stringify(jsonUrls),
+                });
+
+                const data = await response.json();
+                document.getElementById("response").textContent = JSON.stringify(data, null, 2);
+            } catch (error) {
+                document.getElementById("response").textContent = "Invalid JSON input.";
+            }
+        });
+    </script>
+</body>
+</html>

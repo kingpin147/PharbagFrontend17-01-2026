@@ -1,0 +1,58 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <script src="https://unpkg.com/peerjs@1.5.0/dist/peerjs.min.js"></script>
+    <meta charset="UTF-8">
+    <title>WebRTC Data Channel Offer Generator</title>
+</head>
+
+<body>
+    <h1>WebRTC Data Channel Offer Generator</h1>
+    <textarea id="offerTextarea" placeholder="Enter Peer ID"></textarea>
+    <button id="generateOfferButton">Join</button>
+
+    <textarea id="dataChannelInput" placeholder="Type text to send"></textarea>
+    <button id="sendButton">Send</button>
+
+    <textarea id="receivedData" placeholder="Received data will appear here" readonly></textarea>
+
+    <script>
+        const offerTextarea = document.getElementById('offerTextarea');
+        const generateOfferButton = document.getElementById('generateOfferButton');
+        const dataChannelInput = document.getElementById('dataChannelInput');
+        const sendButton = document.getElementById('sendButton');
+        const receivedDataTextarea = document.getElementById('receivedData');
+        let peerConnection;
+        let dataChannel;
+        let myConnection;
+    
+        const peer = new Peer();
+
+        peer.on('open', function(id) {
+            console.log('My peer ID is: ' + id);
+        });
+
+        generateOfferButton.onclick = () => {
+            myConnection = peer.connect(offerTextarea.value);
+            console.log('Connected to peer with ID:', offerTextarea.value);
+        }
+
+        peer.on('connection', function(conn) {
+            console.log('Connected');
+            myConnection = conn;
+
+            conn.on('data', function(data) {
+                console.log('Received', data);
+                receivedDataTextarea.value = data; // Display received data
+            });
+
+            sendButton.addEventListener('click', function() {
+                const message = dataChannelInput.value;
+                myConnection.send(message);
+                console.log('Sent:', message);
+            });
+        });
+    </script>
+</body>
+</html>

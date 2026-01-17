@@ -1,0 +1,2816 @@
+<?php
+/**
+ * Get user's global privileges and some db-specific privileges
+ */
+
+declare(strict_types=1);
+
+namespace PhpMyAdmin;
+
+use PhpMyAdmin\Query\Utilities;
+use PhpMyAdmin\Utils\SessionCache;
+
+use function mb_strpos;
+use function mb_substr;
+use function preg_match;
+use function preg_replace;
+use function str_contains;
+
+/**
+ * PhpMyAdmin\CheckUserPrivileges class
+ */
+class CheckUserPrivileges
+{
+    /** @var DatabaseInterface */
+    private $dbi;
+
+    /**
+     * @param DatabaseInterface $dbi DatabaseInterface object
+     */
+    public function __construct(DatabaseInterface $dbi)
+    {
+        $this->dbi = $dbi;
+    }
+
+    /**
+     * Extracts details from a result row of a SHOW GRANT query
+     *
+     * @param string $row grant row
+     *
+     * @return array
+     */
+    public function getItemsFromShowGrantsRow(string $row): array
+    {
+        $dbNameOffset = mb_strpos($row, ' ON ') + 4;
+
+        $tableNameEndOffset = mb_strpos($row, ' TO ');
+        $tableNameStartOffset = false;
+        $tableNameStartOffset2 = mb_strpos($row, '`.', $dbNameOffset);
+
+        if ($tableNameStartOffset2 && $tableNameStartOffset2 < $tableNameEndOffset) {
+            $tableNameStartOffset = $tableNameStartOffset2 + 1;
+        }
+
+        if ($tableNameStartOffset === false) {
+            $tableNameStartOffset = mb_strpos($row, '.', $dbNameOffset);
+        }
+
+        $showGrantsDbName = mb_substr($row, $dbNameOffset, $tableNameStartOffset - $dbNameOffset);
+
+        $showGrantsDbName = Util::unQuote($showGrantsDbName, '`');
+
+        $showGrantsString = mb_substr(
+            $row,
+            6,
+            mb_strpos($row, ' ON ') - 6
+        );
+
+        $showGrantsTableName = mb_substr(
+            $row,
+            $tableNameStartOffset + 1,
+            $tableNameEndOffset - $tableNameStartOffset - 1
+        );
+        $showGrantsTableName = Util::unQuote($showGrantsTableName, '`');
+
+        return [
+            $showGrantsString,
+            $showGrantsDbName,
+            $showGrantsTableName,
+        ];
+    }
+
+    /**
+     * Check if user has required privileges for
+     * performing 'Adjust privileges' operations
+     *
+     * @param string $showGrantsString    string containing grants for user
+     * @param string $showGrantsDbName    name of db extracted from grant string
+     * @param string $showGrantsTableName name of table extracted from grant string
+     */
+    public function checkRequiredPrivilegesForAdjust(
+        string $showGrantsString,
+        string $showGrantsDbName,
+        string $showGrantsTableName
+    ): void {
+        // '... ALL PRIVILEGES ON *.* ...' OR '... ALL PRIVILEGES ON `mysql`.* ..'
+        // OR
+        // SELECT, INSERT, UPDATE, DELETE .... ON *.* OR `mysql`.*
+        if (
+            $showGrantsString !== 'ALL'
+            && $showGrantsString !== 'ALL PRIVILEGES'
+            && (mb_strpos($showGrantsString, 'SELECT, INSERT, UPDATE, DELETE') === false)
+        ) {
+            return;
+        }
+
+        if ($showGrantsDbName === '*' && $showGrantsTableName === '*') {
+            $GLOBALS['col_priv'] = true;
+            $GLOBALS['db_priv'] = true;
+            $GLOBALS['proc_priv'] = true;
+            $GLOBALS['table_priv'] = true;
+
+            if ($showGrantsString === 'ALL PRIVILEGES' || $showGrantsString === 'ALL') {
+                $GLOBALS['is_reload_priv'] = true;
+            }
+        }
+
+        // check for specific tables in `mysql` db
+        // Ex. '... ALL PRIVILEGES on `mysql`.`columns_priv` .. '
+        if ($showGrantsDbName !== 'mysql') {
+            return;
+        }
+
+        switch ($showGrantsTableName) {
+            case 'columns_priv':
+                $GLOBALS['col_priv'] = true;
+                break;
+            case 'db':
+                $GLOBALS['db_priv'] = true;
+                break;
+            case 'procs_priv':
+                $GLOBALS['proc_priv'] = true;
+                break;
+            case 'tables_priv':
+                $GLOBALS['table_priv'] = true;
+                break;
+            case '*':
+                $GLOBALS['col_priv'] = true;
+                $GLOBALS['db_priv'] = true;
+                $GLOBALS['proc_priv'] = true;
+                $GLOBALS['table_priv'] = true;
+                break;
+            default:
+        }
+    }
+
+    /**
+     * sets privilege information extracted from SHOW GRANTS result
+     *
+     * Detection for some CREATE privilege.
+     *
+     * Since MySQL 4.1.2, we can easily detect current user's grants using $userlink
+     * (no control user needed) and we don't have to try any other method for
+     * detection
+     *
+     * @todo fix to get really all privileges, not only explicitly defined for this user
+     * from MySQL manual: (https://dev.mysql.com/doc/refman/5.0/en/show-grants.html)
+     * SHOW GRANTS displays only the privileges granted explicitly to the named
+     * account. Other privileges might be available to the account, but they are not
+     * displayed. For example, if an anonymous account exists, the named account
+     * might be able to use its privileges, but SHOW GRANTS will not display them.
+     */
+    private function analyseShowGrant(): void
+    {
+        if (SessionCache::has('is_create_db_priv')) {
+            $GLOBALS['is_create_db_priv'] = SessionCache::get('is_create_db_priv');
+            $GLOBALS['is_reload_priv'] = SessionCache::get('is_reload_priv');
+            $GLOBALS['db_to_create'] = SessionCache::get('db_to_create');
+            $GLOBALS['dbs_where_create_table_allowed'] = SessionCache::get('dbs_where_create_table_allowed');
+            $GLOBALS['dbs_to_test'] = SessionCache::get('dbs_to_test');
+
+            $GLOBALS['db_priv'] = SessionCache::get('db_priv');
+            $GLOBALS['col_priv'] = SessionCache::get('col_priv');
+            $GLOBALS['table_priv'] = SessionCache::get('table_priv');
+            $GLOBALS['proc_priv'] = SessionCache::get('proc_priv');
+
+            return;
+        }
+
+        // defaults
+        $GLOBALS['is_create_db_priv'] = false;
+        $GLOBALS['is_reload_priv'] = false;
+        $GLOBALS['db_to_create'] = '';
+        $GLOBALS['dbs_where_create_table_allowed'] = [];
+        $GLOBALS['dbs_to_test'] = Utilities::getSystemSchemas();
+        $GLOBALS['proc_priv'] = false;
+        $GLOBALS['db_priv'] = false;
+        $GLOBALS['col_priv'] = false;
+        $GLOBALS['table_priv'] = false;
+
+        $showGrantsResult = $this->dbi->tryQuery('SHOW GRANTS');
+
+        if (! $showGrantsResult) {
+            return;
+        }
+
+        $re0 = '(^|(\\\\\\\\)+|[^\\\\])'; // non-escaped wildcards
+        $re1 = '(^|[^\\\\])(\\\)+'; // escaped wildcards
+
+        while ($row = $showGrantsResult->fetchRow()) {
+            [
+                $showGrantsString,
+                $showGrantsDbName,
+                $showGrantsTableName,
+            ] = $this->getItemsFromShowGrantsRow($row[0]);
+
+            if ($showGrantsDbName === '*') {
+                if ($showGrantsString !== 'USAGE') {
+                    $GLOBALS['dbs_to_test'] = false;
+                }
+            } elseif ($GLOBALS['dbs_to_test'] !== false) {
+                $GLOBALS['dbs_to_test'][] = $showGrantsDbName;
+            }
+
+            if (str_contains($showGrantsString, 'RELOAD')) {
+                $GLOBALS['is_reload_priv'] = true;
+            }
+
+            // check for the required privileges for adjust
+            $this->checkRequiredPrivilegesForAdjust($showGrantsString, $showGrantsDbName, $showGrantsTableName);
+
+            /**
+             * @todo if we find CREATE VIEW but not CREATE, do not offer
+             * the create database dialog box
+             */
+            if (
+                $showGrantsString !== 'ALL'
+                && $showGrantsString !== 'ALL PRIVILEGES'
+                && $showGrantsString !== 'CREATE'
+                && ! str_contains($showGrantsString, 'CREATE,')
+            ) {
+                continue;
+            }
+
+            if ($showGrantsDbName === '*') {
+                // a global CREATE privilege
+                $GLOBALS['is_create_db_priv'] = true;
+                $GLOBALS['is_reload_priv'] = true;
+                $GLOBALS['db_to_create'] = '';
+                $GLOBALS['dbs_where_create_table_allowed'][] = '*';
+                // @todo we should not break here, cause GRANT ALL *.*
+                // could be revoked by a later rule like GRANT SELECT ON db.*
+                break;
+            }
+
+            // this array may contain wildcards
+            $GLOBALS['dbs_where_create_table_allowed'][] = $showGrantsDbName;
+
+            $dbNameToTest = Util::backquote($showGrantsDbName);
+
+            if ($GLOBALS['is_create_db_priv']) {
+                // no need for any more tests if we already know this
+                continue;
+            }
+
+            // does this db exist?
+            if (
+                (! preg_match('/' . $re0 . '%|_/', $showGrantsDbName)
+                || preg_match('/\\\\%|\\\\_/', $showGrantsDbName))
+                && ($this->dbi->tryQuery(
+                    'USE ' . preg_replace(
+                        '/' . $re1 . '(%|_)/',
+                        '\\1\\3',
+                        $dbNameToTest
+                    )
+                )
+                || mb_substr($this->dbi->getError(), 1, 4) == 1044)
+            ) {
+                continue;
+            }
+
+            /**
+             * Do not handle the underscore wildcard
+             * (this case must be rare anyway)
+             */
+            $GLOBALS['db_to_create'] = preg_replace('/' . $re0 . '%/', '\\1', $showGrantsDbName);
+            $GLOBALS['db_to_create'] = preg_replace('/' . $re1 . '(%|_)/', '\\1\\3', $GLOBALS['db_to_create']);
+            $GLOBALS['is_create_db_priv'] = true;
+
+            /**
+             * @todo collect $GLOBALS['db_to_create'] into an array,
+             * to display a drop-down in the "Create database" dialog
+             */
+             // we don't break, we want all possible databases
+             //break;
+        }
+
+        // must also cacheUnset() them in
+        // PhpMyAdmin\Plugins\Auth\AuthenticationCookie
+        SessionCache::set('is_create_db_priv', $GLOBALS['is_create_db_priv']);
+        SessionCache::set('is_reload_priv', $GLOBALS['is_reload_priv']);
+        SessionCache::set('db_to_create', $GLOBALS['db_to_create']);
+        SessionCache::set('dbs_where_create_table_allowed', $GLOBALS['dbs_where_create_table_allowed']);
+        SessionCache::set('dbs_to_test', $GLOBALS['dbs_to_test']);
+
+        SessionCache::set('proc_priv', $GLOBALS['proc_priv']);
+        SessionCache::set('table_priv', $GLOBALS['table_priv']);
+        SessionCache::set('col_priv', $GLOBALS['col_priv']);
+        SessionCache::set('db_priv', $GLOBALS['db_priv']);
+    }
+
+    /**
+     * Get user's global privileges and some db-specific privileges
+     */
+    public function getPrivileges(): void
+    {
+        $username = '';
+
+        $current = $this->dbi->getCurrentUserAndHost();
+        if (! empty($current)) {
+            [$username] = $current;
+        }
+
+        // If MySQL is started with --skip-grant-tables
+        if ($username === '') {
+            $GLOBALS['is_create_db_priv'] = true;
+            $GLOBALS['is_reload_priv'] = true;
+            $GLOBALS['db_to_create'] = '';
+            $GLOBALS['dbs_where_create_table_allowed'] = ['*'];
+            $GLOBALS['dbs_to_test'] = false;
+            $GLOBALS['db_priv'] = true;
+            $GLOBALS['col_priv'] = true;
+            $GLOBALS['table_priv'] = true;
+            $GLOBALS['proc_priv'] = true;
+
+            return;
+        }
+
+        $this->analyseShowGrant();
+    }
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          ‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃя<?php
+/**
+ * This library is used with the server IP allow/deny host authentication
+ * feature
+ */
+
+declare(strict_types=1);
+
+namespace PhpMyAdmin;
+
+use function bin2hex;
+use function dechex;
+use function explode;
+use function hash_equals;
+use function hexdec;
+use function inet_pton;
+use function ip2long;
+use function is_array;
+use function mb_strpos;
+use function mb_strtolower;
+use function mb_substr;
+use function min;
+use function preg_match;
+use function str_replace;
+use function substr_replace;
+
+/**
+ * PhpMyAdmin\IpAllowDeny class
+ */
+class IpAllowDeny
+{
+    /**
+     * Matches for IPv4 or IPv6 addresses
+     *
+     * @param string $testRange string of IP range to match
+     * @param string $ipToTest  string of IP to test against range
+     */
+    public function ipMaskTest($testRange, $ipToTest): bool
+    {
+        if (mb_strpos($testRange, ':') > -1 || mb_strpos($ipToTest, ':') > -1) {
+            // assume IPv6
+            $result = $this->ipv6MaskTest($testRange, $ipToTest);
+        } else {
+            $result = $this->ipv4MaskTest($testRange, $ipToTest);
+        }
+
+        return $result;
+    }
+
+    /**
+     * Based on IP Pattern Matcher
+     * Originally by J.Adams <jna@retina.net>
+     * Found on <https://www.php.net/manual/en/function.ip2long.php>
+     * Modified for phpMyAdmin
+     *
+     * Matches:
+     * xxx.xxx.xxx.xxx        (exact)
+     * xxx.xxx.xxx.[yyy-zzz]  (range)
+     * xxx.xxx.xxx.xxx/nn     (CIDR)
+     *
+     * Does not match:
+     * xxx.xxx.xxx.xx[yyy-zzz]  (range, partial octets not supported)
+     *
+     * @param string $testRange string of IP range to match
+     * @param string $ipToTest  string of IP to test against range
+     */
+    public function ipv4MaskTest($testRange, $ipToTest): bool
+    {
+        $result = true;
+        $match = preg_match('|([0-9]+)\.([0-9]+)\.([0-9]+)\.([0-9]+)/([0-9]+)|', $testRange, $regs);
+        if ($match) {
+            // performs a mask match
+            $ipl = ip2long($ipToTest);
+            $rangel = ip2long($regs[1] . '.' . $regs[2] . '.' . $regs[3] . '.' . $regs[4]);
+
+            $maskl = 0;
+
+            for ($i = 0; $i < 31; $i++) {
+                if ($i >= $regs[5] - 1) {
+                    continue;
+                }
+
+                $maskl += 2 ** (30 - $i);
+            }
+
+            return ($maskl & $rangel) == ($maskl & $ipl);
+        }
+
+        // range based
+        $maskocts = explode('.', $testRange);
+        $ipocts = explode('.', $ipToTest);
+
+        // perform a range match
+        for ($i = 0; $i < 4; $i++) {
+            if (preg_match('|\[([0-9]+)\-([0-9]+)\]|', $maskocts[$i], $regs)) {
+                if (($ipocts[$i] > $regs[2]) || ($ipocts[$i] < $regs[1])) {
+                    $result = false;
+                }
+            } else {
+                if ($maskocts[$i] <> $ipocts[$i]) {
+                    $result = false;
+                }
+            }
+        }
+
+        return $result;
+    }
+
+    /**
+     * IPv6 matcher
+     * CIDR section taken from https://stackoverflow.com/a/10086404
+     * Modified for phpMyAdmin
+     *
+     * Matches:
+     * xxxx:xxxx:xxxx:xxxx:xxxx:xxxx:xxxx:xxxx
+     * (exact)
+     * xxxx:xxxx:xxxx:xxxx:xxxx:xxxx:xxxx:[yyyy-zzzz]
+     * (range, only at end of IP - no subnets)
+     * xxxx:xxxx:xxxx:xxxx/nn
+     * (CIDR)
+     *
+     * Does not match:
+     * xxxx:xxxx:xxxx:xxxx:xxxx:xxxx:xxxx:xx[yyy-zzz]
+     * (range, partial octets not supported)
+     *
+     * @param string $test_range string of IP range to match
+     * @param string $ip_to_test string of IP to test against range
+     */
+    public function ipv6MaskTest($test_range, $ip_to_test): bool
+    {
+        $result = true;
+
+        // convert to lowercase for easier comparison
+        $test_range = mb_strtolower($test_range);
+        $ip_to_test = mb_strtolower($ip_to_test);
+
+        $is_cidr = mb_strpos($test_range, '/') > -1;
+        $is_range = mb_strpos($test_range, '[') > -1;
+        $is_single = ! $is_cidr && ! $is_range;
+
+        $ip_hex = bin2hex((string) inet_pton($ip_to_test));
+
+        if ($is_single) {
+            $range_hex = bin2hex((string) inet_pton($test_range));
+
+            return hash_equals($ip_hex, $range_hex);
+        }
+
+        if ($is_range) {
+            // what range do we operate on?
+            $range_match = [];
+            $match = preg_match('/\[([0-9a-f]+)\-([0-9a-f]+)\]/', $test_range, $range_match);
+            if ($match) {
+                $range_start = $range_match[1];
+                $range_end = $range_match[2];
+
+                // get the first and last allowed IPs
+                $first_ip = str_replace($range_match[0], $range_start, $test_range);
+                $first_hex = bin2hex((string) inet_pton($first_ip));
+                $last_ip = str_replace($range_match[0], $range_end, $test_range);
+                $last_hex = bin2hex((string) inet_pton($last_ip));
+
+                // check if the IP to test is within the range
+                $result = ($ip_hex >= $first_hex && $ip_hex <= $last_hex);
+            }
+
+            return $result;
+        }
+
+        if ($is_cidr) {
+            // Split in address and prefix length
+            [$first_ip, $subnet] = explode('/', $test_range);
+
+            // Parse the address into a binary string
+            $first_bin = inet_pton($first_ip);
+            $first_hex = bin2hex((string) $first_bin);
+
+            $flexbits = 128 - (int) $subnet;
+
+            // Build the hexadecimal string of the last address
+            $last_hex = $first_hex;
+
+            $pos = 31;
+            while ($flexbits > 0) {
+                // Get the character at this position
+                $orig = mb_substr($last_hex, $pos, 1);
+
+                // Convert it to an integer
+                $origval = hexdec($orig);
+
+                // OR it with (2^flexbits)-1, with flexbits limited to 4 at a time
+                $newval = $origval | 2 ** min(4, $flexbits) - 1;
+
+                // Convert it back to a hexadecimal character
+                $new = dechex($newval);
+
+                // And put that character back in the string
+                $last_hex = substr_replace($last_hex, $new, $pos, 1);
+
+                // We processed one nibble, move to previous position
+                $flexbits -= 4;
+                --$pos;
+            }
+
+            // check if the IP to test is within the range
+            $result = ($ip_hex >= $first_hex && $ip_hex <= $last_hex);
+        }
+
+        return $result;
+    }
+
+    /**
+     * Runs through IP Allow rules the use of it below for more information
+     *
+     * @see     Core::getIp()
+     */
+    public function allow(): bool
+    {
+        return $this->allowDeny('allow');
+    }
+
+    /**
+     * Runs through IP Deny rules the use of it below for more information
+     *
+     * @see     Core::getIp()
+     */
+    public function deny(): bool
+    {
+        return $this->allowDeny('deny');
+    }
+
+    /**
+     * Runs through IP Allow/Deny rules the use of it below for more information
+     *
+     * @see     Core::getIp()
+     *
+     * @param string $type 'allow' | 'deny' type of rule to match
+     */
+    private function allowDeny($type): bool
+    {
+        global $cfg;
+
+        // Grabs true IP of the user and returns if it can't be found
+        $remote_ip = Core::getIp();
+        if (empty($remote_ip)) {
+            return false;
+        }
+
+        // copy username
+        $username = $cfg['Server']['user'];
+
+        // copy rule database
+        if (isset($cfg['Server']['AllowDeny']['rules'])) {
+            $rules = $cfg['Server']['AllowDeny']['rules'];
+            if (! is_array($rules)) {
+                $rules = [];
+            }
+        } else {
+            $rules = [];
+        }
+
+        // lookup table for some name shortcuts
+        $shortcuts = [
+            'all' => '0.0.0.0/0',
+            'localhost' => '127.0.0.1/8',
+        ];
+
+        // Provide some useful shortcuts if server gives us address:
+        if (Core::getenv('SERVER_ADDR')) {
+            $shortcuts['localnetA'] = Core::getenv('SERVER_ADDR') . '/8';
+            $shortcuts['localnetB'] = Core::getenv('SERVER_ADDR') . '/16';
+            $shortcuts['localnetC'] = Core::getenv('SERVER_ADDR') . '/24';
+        }
+
+        foreach ($rules as $rule) {
+            // extract rule data
+            $rule_data = explode(' ', $rule);
+
+            // check for rule type
+            if ($rule_data[0] != $type) {
+                continue;
+            }
+
+            // check for username
+            if (
+                ($rule_data[1] !== '%') //wildcarded first
+                && (! hash_equals($rule_data[1], $username))
+            ) {
+                continue;
+            }
+
+            // check if the config file has the full string with an extra
+            // 'from' in it and if it does, just discard it
+            if ($rule_data[2] === 'from') {
+                $rule_data[2] = $rule_data[3];
+            }
+
+            // Handle shortcuts with above array
+            if (isset($shortcuts[$rule_data[2]])) {
+                $rule_data[2] = $shortcuts[$rule_data[2]];
+            }
+
+            // Add code for host lookups here
+            // Excluded for the moment
+
+            // Do the actual matching now
+            if ($this->ipMaskTest($rule_data[2], $remote_ip)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       ЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя<?php
+
+declare(strict_types=1);
+
+namespace PhpMyAdmin;
+
+use PhpMyAdmin\ConfigStorage\Relation;
+use PhpMyAdmin\Dbal\DatabaseName;
+use PhpMyAdmin\Dbal\TableName;
+use PhpMyAdmin\Http\Factory\ServerRequestFactory;
+use PhpMyAdmin\Http\ServerRequest;
+use PhpMyAdmin\Plugins\AuthenticationPlugin;
+use PhpMyAdmin\SqlParser\Lexer;
+use Symfony\Component\DependencyInjection\ContainerInterface;
+use Webmozart\Assert\Assert;
+use Webmozart\Assert\InvalidArgumentException;
+
+use function __;
+use function array_pop;
+use function count;
+use function date_default_timezone_get;
+use function date_default_timezone_set;
+use function define;
+use function defined;
+use function explode;
+use function extension_loaded;
+use function function_exists;
+use function hash_equals;
+use function htmlspecialchars;
+use function implode;
+use function ini_get;
+use function ini_set;
+use function is_array;
+use function is_scalar;
+use function mb_internal_encoding;
+use function mb_strlen;
+use function mb_strpos;
+use function mb_strrpos;
+use function mb_substr;
+use function register_shutdown_function;
+use function session_id;
+use function strlen;
+use function trigger_error;
+use function urldecode;
+
+use const E_USER_ERROR;
+
+final class Common
+{
+    /**
+     * Misc stuff and REQUIRED by ALL the scripts.
+     * MUST be included by every script
+     *
+     * Among other things, it contains the advanced authentication work.
+     *
+     * Order of sections:
+     *
+     * the authentication libraries must be before the connection to db
+     *
+     * ... so the required order is:
+     *
+     * LABEL_variables_init
+     *  - initialize some variables always needed
+     * LABEL_parsing_config_file
+     *  - parsing of the configuration file
+     * LABEL_loading_language_file
+     *  - loading language file
+     * LABEL_setup_servers
+     *  - check and setup configured servers
+     * LABEL_theme_setup
+     *  - setting up themes
+     *
+     * - load of MySQL extension (if necessary)
+     * - loading of an authentication library
+     * - db connection
+     * - authentication work
+     */
+    public static function run(): void
+    {
+        global $containerBuilder, $errorHandler, $config, $server, $dbi, $request;
+        global $lang, $cfg, $isConfigLoading, $auth_plugin, $route, $theme;
+        global $urlParams, $isMinimumCommon, $sql_query, $token_mismatch;
+
+        $request = ServerRequestFactory::createFromGlobals();
+
+        $route = Routing::getCurrentRoute();
+
+        if ($route === '/import-status') {
+            $isMinimumCommon = true;
+        }
+
+        $containerBuilder = Core::getContainerBuilder();
+
+        /** @var ErrorHandler $errorHandler */
+        $errorHandler = $containerBuilder->get('error_handler');
+
+        self::checkRequiredPhpExtensions();
+        self::configurePhpSettings();
+        self::cleanupPathInfo();
+
+        /* parsing configuration file                  LABEL_parsing_config_file      */
+
+        /** @var bool $isConfigLoading Indication for the error handler */
+        $isConfigLoading = false;
+
+        register_shutdown_function([Config::class, 'fatalErrorHandler']);
+
+        /**
+         * Force reading of config file, because we removed sensitive values
+         * in the previous iteration.
+         *
+         * @var Config $config
+         */
+        $config = $containerBuilder->get('config');
+
+        /**
+         * include session handling after the globals, to prevent overwriting
+         */
+        if (! defined('PMA_NO_SESSION')) {
+            Session::setUp($config, $errorHandler);
+        }
+
+        $request = Core::populateRequestWithEncryptedQueryParams($request);
+
+        /**
+         * init some variables LABEL_variables_init
+         */
+
+        /**
+         * holds parameters to be passed to next page
+         *
+         * @global array $urlParams
+         */
+        $urlParams = [];
+        $containerBuilder->setParameter('url_params', $urlParams);
+
+        self::setGotoAndBackGlobals($containerBuilder, $config);
+        self::checkTokenRequestParam();
+        self::setDatabaseAndTableFromRequest($containerBuilder, $request);
+
+        /**
+         * SQL query to be executed
+         *
+         * @global string $sql_query
+         */
+        $sql_query = '';
+        if ($request->isPost()) {
+            $sql_query = $request->getParsedBodyParam('sql_query', '');
+        }
+
+        $containerBuilder->setParameter('sql_query', $sql_query);
+
+        //$_REQUEST['set_theme'] // checked later in this file LABEL_theme_setup
+        //$_REQUEST['server']; // checked later in this file
+        //$_REQUEST['lang'];   // checked by LABEL_loading_language_file
+
+        /* loading language file                       LABEL_loading_language_file    */
+
+        /**
+         * lang detection is done here
+         */
+        $language = LanguageManager::getInstance()->selectLanguage();
+        $language->activate();
+
+        /**
+         * check for errors occurred while loading configuration
+         * this check is done here after loading language files to present errors in locale
+         */
+        $config->checkPermissions();
+        $config->checkErrors();
+
+        self::checkServerConfiguration();
+        self::checkRequest();
+
+        /* setup servers                                       LABEL_setup_servers    */
+
+        $config->checkServers();
+
+        /**
+         * current server
+         *
+         * @global integer $server
+         */
+        $server = $config->selectServer();
+        $urlParams['server'] = $server;
+        $containerBuilder->setParameter('server', $server);
+        $containerBuilder->setParameter('url_params', $urlParams);
+
+        $cfg = $config->settings;
+
+        /* setup themes                                          LABEL_theme_setup    */
+
+        $theme = ThemeManager::initializeTheme();
+
+        /** @var DatabaseInterface $dbi */
+        $dbi = null;
+
+        if (isset($isMinimumCommon)) {
+            $config->loadUserPreferences();
+            $containerBuilder->set('theme_manager', ThemeManager::getInstance());
+            Tracker::enable();
+
+            return;
+        }
+
+        /**
+         * save some settings in cookies
+         *
+         * @todo should be done in PhpMyAdmin\Config
+         */
+        $config->setCookie('pma_lang', (string) $lang);
+
+        ThemeManager::getInstance()->setThemeCookie();
+
+        $dbi = DatabaseInterface::load();
+        $containerBuilder->set(DatabaseInterface::class, $dbi);
+        $containerBuilder->setAlias('dbi', DatabaseInterface::class);
+
+        if (! empty($cfg['Server'])) {
+            $config->getLoginCookieValidityFromCache($server);
+
+            $auth_plugin = Plugins::getAuthPlugin();
+            $auth_plugin->authenticate();
+
+            /* Enable LOAD DATA LOCAL INFILE for LDI plugin */
+            if ($route === '/import' && ($_POST['format'] ?? '') === 'ldi') {
+                // Switch this before the DB connection is done
+                // phpcs:disable PSR1.Files.SideEffects
+                define('PMA_ENABLE_LDI', 1);
+                // phpcs:enable
+            }
+
+            self::connectToDatabaseServer($dbi, $auth_plugin);
+
+            $auth_plugin->rememberCredentials();
+
+            $auth_plugin->checkTwoFactor();
+
+            /* Log success */
+            Logging::logUser($cfg['Server']['user']);
+
+            if ($dbi->getVersion() < $cfg['MysqlMinVersion']['internal']) {
+                Core::fatalError(
+                    __('You should upgrade to %s %s or later.'),
+                    [
+                        'MySQL',
+                        $cfg['MysqlMinVersion']['human'],
+                    ]
+                );
+            }
+
+            // Sets the default delimiter (if specified).
+            $sqlDelimiter = $request->getParam('sql_delimiter', '');
+            if (strlen($sqlDelimiter) > 0) {
+                // phpcs:ignore Squiz.NamingConventions.ValidVariableName.MemberNotCamelCaps
+                Lexer::$DEFAULT_DELIMITER = $sqlDelimiter;
+            }
+
+            // TODO: Set SQL modes too.
+        } else { // end server connecting
+            $response = ResponseRenderer::getInstance();
+            $response->getHeader()->disableMenuAndConsole();
+            $response->getFooter()->setMinimal();
+        }
+
+        $response = ResponseRenderer::getInstance();
+
+        /**
+         * There is no point in even attempting to process
+         * an ajax request if there is a token mismatch
+         */
+        if ($response->isAjax() && $request->isPost() && $token_mismatch) {
+            $response->setRequestStatus(false);
+            $response->addJSON(
+                'message',
+                Message::error(__('Error: Token mismatch'))
+            );
+            exit;
+        }
+
+        Profiling::check($dbi, $response);
+
+        $containerBuilder->set('response', ResponseRenderer::getInstance());
+
+        // load user preferences
+        $config->loadUserPreferences();
+
+        $containerBuilder->set('theme_manager', ThemeManager::getInstance());
+
+        /* Tell tracker that it can actually work */
+        Tracker::enable();
+
+        if (empty($server) || ! isset($cfg['ZeroConf']) || $cfg['ZeroConf'] !== true) {
+            return;
+        }
+
+        /** @var Relation $relation */
+        $relation = $containerBuilder->get('relation');
+        $dbi->postConnectControl($relation);
+    }
+
+    /**
+     * Checks that required PHP extensions are there.
+     */
+    private static function checkRequiredPhpExtensions(): void
+    {
+        /**
+         * Warning about mbstring.
+         */
+        if (! function_exists('mb_detect_encoding')) {
+            Core::warnMissingExtension('mbstring');
+        }
+
+        /**
+         * We really need this one!
+         */
+        if (! function_exists('preg_replace')) {
+            Core::warnMissingExtension('pcre', true);
+        }
+
+        /**
+         * JSON is required in several places.
+         */
+        if (! function_exists('json_encode')) {
+            Core::warnMissingExtension('json', true);
+        }
+
+        /**
+         * ctype is required for Twig.
+         */
+        if (! function_exists('ctype_alpha')) {
+            Core::warnMissingExtension('ctype', true);
+        }
+
+        /**
+         * hash is required for cookie authentication.
+         */
+        if (function_exists('hash_hmac')) {
+            return;
+        }
+
+        Core::warnMissingExtension('hash', true);
+    }
+
+    /**
+     * Applies changes to PHP configuration.
+     */
+    private static function configurePhpSettings(): void
+    {
+        /**
+         * Set utf-8 encoding for PHP
+         */
+        ini_set('default_charset', 'utf-8');
+        mb_internal_encoding('utf-8');
+
+        /**
+         * Set precision to sane value, with higher values
+         * things behave slightly unexpectedly, for example
+         * round(1.2, 2) returns 1.199999999999999956.
+         */
+        ini_set('precision', '14');
+
+        /**
+         * check timezone setting
+         * this could produce an E_WARNING - but only once,
+         * if not done here it will produce E_WARNING on every date/time function
+         */
+        date_default_timezone_set(@date_default_timezone_get());
+    }
+
+    /**
+     * PATH_INFO could be compromised if set, so remove it from PHP_SELF
+     * and provide a clean PHP_SELF here
+     */
+    public static function cleanupPathInfo(): void
+    {
+        global $PMA_PHP_SELF;
+
+        $PMA_PHP_SELF = Core::getenv('PHP_SELF');
+        if (empty($PMA_PHP_SELF)) {
+            $PMA_PHP_SELF = urldecode(Core::getenv('REQUEST_URI'));
+        }
+
+        $_PATH_INFO = Core::getenv('PATH_INFO');
+        if (! empty($_PATH_INFO) && ! empty($PMA_PHP_SELF)) {
+            $question_pos = mb_strpos($PMA_PHP_SELF, '?');
+            if ($question_pos != false) {
+                $PMA_PHP_SELF = mb_substr($PMA_PHP_SELF, 0, $question_pos);
+            }
+
+            $path_info_pos = mb_strrpos($PMA_PHP_SELF, $_PATH_INFO);
+            if ($path_info_pos !== false) {
+                $path_info_part = mb_substr($PMA_PHP_SELF, $path_info_pos, mb_strlen($_PATH_INFO));
+                if ($path_info_part == $_PATH_INFO) {
+                    $PMA_PHP_SELF = mb_substr($PMA_PHP_SELF, 0, $path_info_pos);
+                }
+            }
+        }
+
+        $path = [];
+        foreach (explode('/', $PMA_PHP_SELF) as $part) {
+            // ignore parts that have no value
+            if (empty($part) || $part === '.') {
+                continue;
+            }
+
+            if ($part !== '..') {
+                // cool, we found a new part
+                $path[] = $part;
+            } elseif (count($path) > 0) {
+                // going back up? sure
+                array_pop($path);
+            }
+
+            // Here we intentionall ignore case where we go too up
+            // as there is nothing sane to do
+        }
+
+        $PMA_PHP_SELF = htmlspecialchars('/' . implode('/', $path));
+    }
+
+    private static function setGotoAndBackGlobals(ContainerInterface $container, Config $config): void
+    {
+        global $goto, $back, $urlParams;
+
+        // Holds page that should be displayed.
+        $goto = '';
+        $container->setParameter('goto', $goto);
+
+        if (isset($_REQUEST['goto']) && Core::checkPageValidity($_REQUEST['goto'])) {
+            $goto = $_REQUEST['goto'];
+            $urlParams['goto'] = $goto;
+            $container->setParameter('goto', $goto);
+            $container->setParameter('url_params', $urlParams);
+        } else {
+            if ($config->issetCookie('goto')) {
+                $config->removeCookie('goto');
+            }
+
+            unset($_REQUEST['goto'], $_GET['goto'], $_POST['goto']);
+        }
+
+        if (isset($_REQUEST['back']) && Core::checkPageValidity($_REQUEST['back'])) {
+            // Returning page.
+            $back = $_REQUEST['back'];
+            $container->setParameter('back', $back);
+
+            return;
+        }
+
+        if ($config->issetCookie('back')) {
+            $config->removeCookie('back');
+        }
+
+        unset($_REQUEST['back'], $_GET['back'], $_POST['back']);
+    }
+
+    /**
+     * Check whether user supplied token is valid, if not remove any possibly
+     * dangerous stuff from request.
+     *
+     * Check for token mismatch only if the Request method is POST.
+     * GET Requests would never have token and therefore checking
+     * mis-match does not make sense.
+     */
+    public static function checkTokenRequestParam(): void
+    {
+        global $token_mismatch, $token_provided;
+
+        $token_mismatch = true;
+        $token_provided = false;
+
+        if (($_SERVER['REQUEST_METHOD'] ?? 'GET') !== 'POST') {
+            return;
+        }
+
+        if (isset($_POST['token']) && is_scalar($_POST['token']) && strlen((string) $_POST['token']) > 0) {
+            $token_provided = true;
+            $token_mismatch = ! @hash_equals($_SESSION[' PMA_token '], (string) $_POST['token']);
+        }
+
+        if (! $token_mismatch) {
+            return;
+        }
+
+        // Warn in case the mismatch is result of failed setting of session cookie
+        if (isset($_POST['set_session']) && $_POST['set_session'] !== session_id()) {
+            trigger_error(
+                __(
+                    'Failed to set session cookie. Maybe you are using HTTP instead of HTTPS to access phpMyAdmin.'
+                ),
+                E_USER_ERROR
+            );
+        }
+
+        /**
+         * We don't allow any POST operation parameters if the token is mismatched
+         * or is not provided.
+         */
+        $allowList = ['ajax_request'];
+        Sanitize::removeRequestVars($allowList);
+    }
+
+    private static function setDatabaseAndTableFromRequest(
+        ContainerInterface $containerBuilder,
+        ServerRequest $request
+    ): void {
+        global $db, $table, $urlParams;
+
+        try {
+            $db = DatabaseName::fromValue($request->getParam('db'))->getName();
+        } catch (InvalidArgumentException $exception) {
+            $db = '';
+        }
+
+        try {
+            Assert::stringNotEmpty($db);
+            $table = TableName::fromValue($request->getParam('table'))->getName();
+        } catch (InvalidArgumentException $exception) {
+            $table = '';
+        }
+
+        if (! is_array($urlParams)) {
+            $urlParams = [];
+        }
+
+        $urlParams['db'] = $db;
+        $urlParams['table'] = $table;
+        $containerBuilder->setParameter('db', $db);
+        $containerBuilder->setParameter('table', $table);
+        $containerBuilder->setParameter('url_params', $urlParams);
+    }
+
+    /**
+     * Check whether PHP configuration matches our needs.
+     */
+    private static function checkServerConfiguration(): void
+    {
+        /**
+         * As we try to handle charsets by ourself, mbstring overloads just
+         * break it, see bug 1063821.
+         *
+         * We specifically use empty here as we are looking for anything else than
+         * empty value or 0.
+         */
+        if (extension_loaded('mbstring') && ! empty(ini_get('mbstring.func_overload'))) {
+            Core::fatalError(
+                __(
+                    'You have enabled mbstring.func_overload in your PHP '
+                    . 'configuration. This option is incompatible with phpMyAdmin '
+                    . 'and might cause some data to be corrupted!'
+                )
+            );
+        }
+
+        /**
+         * The ini_set and ini_get functions can be disabled using
+         * disable_functions but we're relying quite a lot of them.
+         */
+        if (function_exists('ini_get') && function_exists('ini_set')) {
+            return;
+        }
+
+        Core::fatalError(
+            __(
+                'The ini_get and/or ini_set functions are disabled in php.ini. phpMyAdmin requires these functions!'
+            )
+        );
+    }
+
+    /**
+     * Checks request and fails with fatal error if something problematic is found
+     */
+    private static function checkRequest(): void
+    {
+        if (isset($_REQUEST['GLOBALS']) || isset($_FILES['GLOBALS'])) {
+            Core::fatalError(__('GLOBALS overwrite attempt'));
+        }
+
+        /**
+         * protect against possible exploits - there is no need to have so much variables
+         */
+        if (count($_REQUEST) <= 1000) {
+            return;
+        }
+
+        Core::fatalError(__('possible exploit'));
+    }
+
+    private static function connectToDatabaseServer(DatabaseInterface $dbi, AuthenticationPlugin $auth): void
+    {
+        global $cfg;
+
+        /**
+         * Try to connect MySQL with the control user profile (will be used to get the privileges list for the current
+         * user but the true user link must be open after this one so it would be default one for all the scripts).
+         */
+        $controlLink = false;
+        if ($cfg['Server']['controluser'] !== '') {
+            $controlLink = $dbi->connect(DatabaseInterface::CONNECT_CONTROL);
+        }
+
+        // Connects to the server (validates user's login)
+        $userLink = $dbi->connect(DatabaseInterface::CONNECT_USER);
+
+        if ($userLink === false) {
+            $auth->showFailure('mysql-denied');
+        }
+
+        if ($controlLink) {
+            return;
+        }
+
+        /**
+         * Open separate connection for control queries, this is needed to avoid problems with table locking used in
+         * main connection and phpMyAdmin issuing queries to configuration storage, which is not locked by that time.
+         */
+        $dbi->connect(DatabaseInterface::CONNECT_USER, null, DatabaseInterface::CONNECT_CONTROL);
+    }
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                ЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©я                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       ЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя<?php
+/**
+ * Replication helpers
+ */
+
+declare(strict_types=1);
+
+namespace PhpMyAdmin;
+
+use PhpMyAdmin\Dbal\ResultInterface;
+
+use function explode;
+use function mb_strtoupper;
+
+/**
+ * PhpMyAdmin\Replication class
+ */
+class Replication
+{
+    /**
+     * Extracts database or table name from string
+     *
+     * @param string $string contains "dbname.tablename"
+     * @param string $what   what to extract (db|table)
+     *
+     * @return string the extracted part
+     */
+    public function extractDbOrTable($string, $what = 'db')
+    {
+        $list = explode('.', $string);
+        if ($what === 'db') {
+            return $list[0];
+        }
+
+        return $list[1];
+    }
+
+    /**
+     * Configures replication replica
+     *
+     * @param string      $action  possible values: START or STOP
+     * @param string|null $control default: null,
+     *                             possible values: SQL_THREAD or IO_THREAD or null.
+     *                             If it is set to null, it controls both
+     *                             SQL_THREAD and IO_THREAD
+     * @param int         $link    mysql link
+     *
+     * @return ResultInterface|false|int output of DatabaseInterface::tryQuery
+     */
+    public function replicaControl(string $action, ?string $control, int $link)
+    {
+        global $dbi;
+
+        $action = mb_strtoupper($action);
+        $control = $control !== null ? mb_strtoupper($control) : '';
+
+        if ($action !== 'START' && $action !== 'STOP') {
+            return -1;
+        }
+
+        if ($control !== 'SQL_THREAD' && $control !== 'IO_THREAD' && $control != null) {
+            return -1;
+        }
+
+        return $dbi->tryQuery($action . ' SLAVE ' . $control . ';', $link);
+    }
+
+    /**
+     * Changes primary for replication replica
+     *
+     * @param string $user     replication user on primary
+     * @param string $password password for the user
+     * @param string $host     primary's hostname or IP
+     * @param int    $port     port, where mysql is running
+     * @param array  $pos      position of mysql replication, array should contain fields File and Position
+     * @param bool   $stop     shall we stop replica?
+     * @param bool   $start    shall we start replica?
+     * @param int    $link     mysql link
+     *
+     * @return ResultInterface|false output of CHANGE MASTER mysql command
+     */
+    public function replicaChangePrimary(
+        $user,
+        $password,
+        $host,
+        $port,
+        array $pos,
+        bool $stop,
+        bool $start,
+        int $link
+    ) {
+        global $dbi;
+
+        if ($stop) {
+            $this->replicaControl('STOP', null, $link);
+        }
+
+        $out = $dbi->tryQuery(
+            'CHANGE MASTER TO ' .
+            'MASTER_HOST=\'' . $host . '\',' .
+            'MASTER_PORT=' . ($port * 1) . ',' .
+            'MASTER_USER=\'' . $user . '\',' .
+            'MASTER_PASSWORD=\'' . $password . '\',' .
+            'MASTER_LOG_FILE=\'' . $pos['File'] . '\',' .
+            'MASTER_LOG_POS=' . $pos['Position'] . ';',
+            $link
+        );
+
+        if ($start) {
+            $this->replicaControl('START', null, $link);
+        }
+
+        return $out;
+    }
+
+    /**
+     * This function provides connection to remote mysql server
+     *
+     * @param string $user     mysql username
+     * @param string $password password for the user
+     * @param string $host     mysql server's hostname or IP
+     * @param int    $port     mysql remote port
+     * @param string $socket   path to unix socket
+     *
+     * @return mixed mysql link on success
+     */
+    public function connectToPrimary(
+        $user,
+        $password,
+        $host = null,
+        $port = null,
+        $socket = null
+    ) {
+        global $dbi;
+
+        $server = [];
+        $server['user'] = $user;
+        $server['password'] = $password;
+        $server['host'] = Core::sanitizeMySQLHost($host);
+        $server['port'] = $port;
+        $server['socket'] = $socket;
+
+        // 5th parameter set to true means that it's an auxiliary connection
+        // and we must not go back to login page if it fails
+        return $dbi->connect(DatabaseInterface::CONNECT_AUXILIARY, $server);
+    }
+
+    /**
+     * Fetches position and file of current binary log on primary
+     *
+     * @param int $link mysql link
+     *
+     * @return array an array containing File and Position in MySQL replication
+     * on primary server, useful for {@see Replication::replicaChangePrimary()}.
+     * @phpstan-return array{'File'?: string, 'Position'?: string}
+     */
+    public function replicaBinLogPrimary(int $link): array
+    {
+        global $dbi;
+
+        $data = $dbi->fetchResult('SHOW MASTER STATUS', null, null, $link);
+        $output = [];
+
+        if (! empty($data)) {
+            $output['File'] = $data[0]['File'];
+            $output['Position'] = $data[0]['Position'];
+        }
+
+        return $output;
+    }
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   ЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©яЃяЃя‘яЃяЃя‘яЃяЃя©я                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 INDX( 	 J           (   А  и       Ш    m               Й?     ` P     З?     ќ.л†¬–ШФєЌ¬–ШФєЌ¬–Ш±Ќ°gљШ                        D i s p l a y WG     p Z     З?     ҐЌ¬–Ш EЩсdШ Ќ¬–ШЂ8иЊ¬–Ш 0      ¤!               E n c o d i n g . p h p V     @     ` P     З?     X‡¬–Ш‡6+’¬–Ш‡6+’¬–Ш±Ќ°gљШ                        E n g i n e s ЉG     h T     З?     ндЊЌ¬–Ш EЩсdШ›Ќ¬–Ш ПЂЌ¬–Ш @      Ѓ6              	 E r r o r . p h p l e „G     x b     З?     gЫ}Ќ¬–Ш EЩсd d=ЂЌ¬–ШЂ8иЊ¬–Ш P      жH               E r r o r H a n d l e r . p h p N     –G     p `     З?     =хІЌ¬–Ш EЩсdШhWµЌ¬–Ш ПЂЌ¬–Ш 0      ф#               E r r o r R e p o r t . p h p Р?     h V     З?     жр†¬–ШLЈцЌ¬–ШLЈцЌ¬–Ш±Ќ°gљШ                       
+ E x c e p t i o n s  @     ` N     З?     WЗ‡¬–Шн¶зђ¬–Шн¶зђ¬–Ш±Ќ°gљШ                        E x p o r t  ’G     h V     З?     Em©Ќ¬–Ш EЩсdШЋО«Ќ¬–Ш ПЂЌ¬–Ш А      8¶              
+ E x p o r t . p h p a cG     x d    З?     б8Ќ¬–Ш EЩсdШR;:Ќ¬–ШЂ8иЊ¬–Ш 0      ъ,               F i e l d M e t a d a t a . p h p     jG     h R     З?     эJЌ¬–Ш EЩсdШh0LЌ¬–ШЂ8иЊ¬–Ш P      ыN               F i l e . p h p s a g ~G     p `     З?     jпqЌ¬–Ш EЩсdШўQtЌ¬–ШЂ8иЊ¬–Ш       ‚               F i l e L i s t i n g . p h p \G     x d     З?     Qш'Ќ¬–Ш EЩсdШч	)Ќ¬–ШЂ8иЊ¬–Ш       Ю               F l a s h M e s s a g e s . p h p     ЂG     h R     З?     ЭіvЌ¬–Ш EЩсdШyЌ¬–ШЂ8иЊ¬–Ш        )              F o n t . p h p h p   SG     h V     З?     sЋЌ¬–Ш EЩсdШЌ¬–ШЂ8иЊ¬–Ш 0      >               
+ F o o t e r . p h p   т?     X H     З?     gы†¬–Ш«Ђnђ¬–Ш«Ђnђ¬–ШЭпІgљШ                        G i s `G     ` P     З?     ©µ1Ќ¬–Ш EЩсdШ$‰3Ќ¬–ШЂ8иЊ¬–Ш P      pG               G i t . p h p mG     h V     З?     №©PЌ¬–Ш EЩсdШ&WRЌ¬–ШЂ8иЊ¬–Ш P      |O              
+ H e a d e r . p h p  И?     ` J     З?     ¶ак†¬–Ш”№·Ќ¬–Ш”№·Ќ¬–ШЭпІgљШ                        H t  l       х?     ` J     З?     жЫы†¬–Ш~1ѓђ¬–Ш~1ѓђ¬–ШЭпІgљШ                        H t t p e a t ф?     ` L     З?     фґы†¬–Ш=7Ѓђ¬–Ш=7Ѓђ¬–ШЭпІgљШ                        I m a g e a t                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   <?php
+
+declare(strict_types=1);
+
+namespace PhpMyAdmin;
+
+use Throwable;
+
+use function array_pop;
+use function array_slice;
+use function basename;
+use function count;
+use function debug_backtrace;
+use function explode;
+use function function_exists;
+use function get_class;
+use function gettype;
+use function htmlspecialchars;
+use function implode;
+use function in_array;
+use function is_object;
+use function is_scalar;
+use function is_string;
+use function mb_substr;
+use function md5;
+use function realpath;
+use function serialize;
+use function str_replace;
+use function var_export;
+
+use const DIRECTORY_SEPARATOR;
+use const E_COMPILE_ERROR;
+use const E_COMPILE_WARNING;
+use const E_CORE_ERROR;
+use const E_CORE_WARNING;
+use const E_DEPRECATED;
+use const E_ERROR;
+use const E_NOTICE;
+use const E_PARSE;
+use const E_RECOVERABLE_ERROR;
+use const E_STRICT;
+use const E_USER_DEPRECATED;
+use const E_USER_ERROR;
+use const E_USER_NOTICE;
+use const E_USER_WARNING;
+use const E_WARNING;
+use const PATH_SEPARATOR;
+
+/**
+ * a single error
+ */
+class Error extends Message
+{
+    /**
+     * Error types
+     *
+     * @var array
+     */
+    public static $errortype = [
+        0 => 'Internal error',
+        E_ERROR => 'Error',
+        E_WARNING => 'Warning',
+        E_PARSE => 'Parsing Error',
+        E_NOTICE => 'Notice',
+        E_CORE_ERROR => 'Core Error',
+        E_CORE_WARNING => 'Core Warning',
+        E_COMPILE_ERROR => 'Compile Error',
+        E_COMPILE_WARNING => 'Compile Warning',
+        E_USER_ERROR => 'User Error',
+        E_USER_WARNING => 'User Warning',
+        E_USER_NOTICE => 'User Notice',
+        E_STRICT => 'Runtime Notice',
+        E_DEPRECATED => 'Deprecation Notice',
+        E_USER_DEPRECATED => 'Deprecation Notice',
+        E_RECOVERABLE_ERROR => 'Catchable Fatal Error',
+    ];
+
+    /**
+     * Error levels
+     *
+     * @var array
+     */
+    public static $errorlevel = [
+        0 => 'error',
+        E_ERROR => 'error',
+        E_WARNING => 'error',
+        E_PARSE => 'error',
+        E_NOTICE => 'notice',
+        E_CORE_ERROR => 'error',
+        E_CORE_WARNING => 'error',
+        E_COMPILE_ERROR => 'error',
+        E_COMPILE_WARNING => 'error',
+        E_USER_ERROR => 'error',
+        E_USER_WARNING => 'error',
+        E_USER_NOTICE => 'notice',
+        E_STRICT => 'notice',
+        E_DEPRECATED => 'notice',
+        E_USER_DEPRECATED => 'notice',
+        E_RECOVERABLE_ERROR => 'error',
+    ];
+
+    /**
+     * The file in which the error occurred
+     *
+     * @var string
+     */
+    protected $file = '';
+
+    /**
+     * The line in which the error occurred
+     *
+     * @var int
+     */
+    protected $line = 0;
+
+    /**
+     * Holds the backtrace for this error
+     *
+     * @var array
+     */
+    protected $backtrace = [];
+
+    /**
+     * Hide location of errors
+     *
+     * @var bool
+     */
+    protected $hideLocation = false;
+
+    /**
+     * @param int    $errno   error number
+     * @param string $errstr  error message
+     * @param string $errfile file
+     * @param int    $errline line
+     */
+    public function __construct(int $errno, string $errstr, string $errfile, int $errline)
+    {
+        parent::__construct();
+        $this->setNumber($errno);
+        $this->setMessage($errstr, false);
+        $this->setFile($errfile);
+        $this->setLine($errline);
+
+        // This function can be disabled in php.ini
+        if (function_exists('debug_backtrace')) {
+            $backtrace = @debug_backtrace();
+            // remove last three calls:
+            // debug_backtrace(), handleError() and addError()
+            $backtrace = array_slice($backtrace, 3);
+        } else {
+            $backtrace = [];
+        }
+
+        $this->setBacktrace($backtrace);
+    }
+
+    /**
+     * Process backtrace to avoid path disclosures, objects and so on
+     *
+     * @param array $backtrace backtrace
+     *
+     * @return array
+     */
+    public static function processBacktrace(array $backtrace): array
+    {
+        $result = [];
+
+        $members = [
+            'line',
+            'function',
+            'class',
+            'type',
+        ];
+
+        foreach ($backtrace as $idx => $step) {
+            /* Create new backtrace entry */
+            $result[$idx] = [];
+
+            /* Make path relative */
+            if (isset($step['file'])) {
+                $result[$idx]['file'] = self::relPath($step['file']);
+            }
+
+            /* Store members we want */
+            foreach ($members as $name) {
+                if (! isset($step[$name])) {
+                    continue;
+                }
+
+                $result[$idx][$name] = $step[$name];
+            }
+
+            /* Store simplified args */
+            if (! isset($step['args'])) {
+                continue;
+            }
+
+            foreach ($step['args'] as $key => $arg) {
+                $result[$idx]['args'][$key] = self::getArg($arg, $step['function']);
+            }
+        }
+
+        return $result;
+    }
+
+    /**
+     * Toggles location hiding
+     *
+     * @param bool $hide Whether to hide
+     */
+    public function setHideLocation(bool $hide): void
+    {
+        $this->hideLocation = $hide;
+    }
+
+    /**
+     * sets PhpMyAdmin\Error::$_backtrace
+     *
+     * We don't store full arguments to avoid wakeup or memory problems.
+     *
+     * @param array $backtrace backtrace
+     */
+    public function setBacktrace(array $backtrace): void
+    {
+        $this->backtrace = self::processBacktrace($backtrace);
+    }
+
+    /**
+     * sets PhpMyAdmin\Error::$_line
+     *
+     * @param int $line the line
+     */
+    public function setLine(int $line): void
+    {
+        $this->line = $line;
+    }
+
+    /**
+     * sets PhpMyAdmin\Error::$_file
+     *
+     * @param string $file the file
+     */
+    public function setFile(string $file): void
+    {
+        $this->file = self::relPath($file);
+    }
+
+    /**
+     * returns unique PhpMyAdmin\Error::$hash, if not exists it will be created
+     *
+     * @return string PhpMyAdmin\Error::$hash
+     */
+    public function getHash(): string
+    {
+        try {
+            $backtrace = serialize($this->getBacktrace());
+        } catch (Throwable $e) {
+            $backtrace = '';
+        }
+
+        if ($this->hash === null) {
+            $this->hash = md5(
+                $this->getNumber() .
+                $this->getMessage() .
+                $this->getFile() .
+                $this->getLine() .
+                $backtrace
+            );
+        }
+
+        return $this->hash;
+    }
+
+    /**
+     * returns PhpMyAdmin\Error::$_backtrace for first $count frames
+     * pass $count = -1 to get full backtrace.
+     * The same can be done by not passing $count at all.
+     *
+     * @param int $count Number of stack frames.
+     *
+     * @return array PhpMyAdmin\Error::$_backtrace
+     */
+    public function getBacktrace(int $count = -1): array
+    {
+        if ($count != -1) {
+            return array_slice($this->backtrace, 0, $count);
+        }
+
+        return $this->backtrace;
+    }
+
+    /**
+     * returns PhpMyAdmin\Error::$file
+     *
+     * @return string PhpMyAdmin\Error::$file
+     */
+    public function getFile(): string
+    {
+        return $this->file;
+    }
+
+    /**
+     * returns PhpMyAdmin\Error::$line
+     *
+     * @return int PhpMyAdmin\Error::$line
+     */
+    public function getLine(): int
+    {
+        return $this->line;
+    }
+
+    /**
+     * returns type of error
+     *
+     * @return string type of error
+     */
+    public function getType(): string
+    {
+        return self::$errortype[$this->getNumber()];
+    }
+
+    /**
+     * returns level of error
+     *
+     * @return string level of error
+     */
+    public function getLevel(): string
+    {
+        return self::$errorlevel[$this->getNumber()];
+    }
+
+    /**
+     * returns title prepared for HTML Title-Tag
+     *
+     * @return string HTML escaped and truncated title
+     */
+    public function getHtmlTitle(): string
+    {
+        return htmlspecialchars(
+            mb_substr($this->getTitle(), 0, 100)
+        );
+    }
+
+    /**
+     * returns title for error
+     */
+    public function getTitle(): string
+    {
+        return $this->getType() . ': ' . $this->getMessage();
+    }
+
+    /**
+     * Get HTML backtrace
+     */
+    public function getBacktraceDisplay(): string
+    {
+        return self::formatBacktrace(
+            $this->getBacktrace(),
+            "<br>\n",
+            "<br>\n"
+        );
+    }
+
+    /**
+     * return formatted backtrace field
+     *
+     * @param array  $backtrace Backtrace data
+     * @param string $separator Arguments separator to use
+     * @param string $lines     Lines separator to use
+     *
+     * @return string formatted backtrace
+     */
+    public static function formatBacktrace(
+        array $backtrace,
+        string $separator,
+        string $lines
+    ): string {
+        $retval = '';
+
+        foreach ($backtrace as $step) {
+            if (isset($step['file'], $step['line'])) {
+                $retval .= self::relPath($step['file'])
+                    . '#' . $step['line'] . ': ';
+            }
+
+            if (isset($step['class'])) {
+                $retval .= $step['class'] . $step['type'];
+            }
+
+            $retval .= self::getFunctionCall($step, $separator);
+            $retval .= $lines;
+        }
+
+        return $retval;
+    }
+
+    /**
+     * Formats function call in a backtrace
+     *
+     * @param array  $step      backtrace step
+     * @param string $separator Arguments separator to use
+     */
+    public static function getFunctionCall(array $step, string $separator): string
+    {
+        $retval = $step['function'] . '(';
+        if (isset($step['args'])) {
+            if (count($step['args']) > 1) {
+                $retval .= $separator;
+                foreach ($step['args'] as $arg) {
+                    $retval .= "\t";
+                    $retval .= $arg;
+                    $retval .= ',' . $separator;
+                }
+            } elseif (count($step['args']) > 0) {
+                foreach ($step['args'] as $arg) {
+                    $retval .= $arg;
+                }
+            }
+        }
+
+        return $retval . ')';
+    }
+
+    /**
+     * Get a single function argument
+     *
+     * if $function is one of include/require
+     * the $arg is converted to a relative path
+     *
+     * @param mixed  $arg      argument to process
+     * @param string $function function name
+     */
+    public static function getArg($arg, string $function): string
+    {
+        $retval = '';
+        $includeFunctions = [
+            'include',
+            'include_once',
+            'require',
+            'require_once',
+        ];
+        $connectFunctions = [
+            'mysql_connect',
+            'mysql_pconnect',
+            'mysqli_connect',
+            'mysqli_real_connect',
+            'connect',
+            '_realConnect',
+        ];
+
+        if (in_array($function, $includeFunctions)) {
+            $retval .= self::relPath($arg);
+        } elseif (in_array($function, $connectFunctions) && is_string($arg)) {
+            $retval .= gettype($arg) . ' ********';
+        } elseif (is_scalar($arg)) {
+            $retval .= gettype($arg) . ' '
+                . htmlspecialchars(var_export($arg, true));
+        } elseif (is_object($arg)) {
+            $retval .= '<Class:' . get_class($arg) . '>';
+        } else {
+            $retval .= gettype($arg);
+        }
+
+        return $retval;
+    }
+
+    /**
+     * Gets the error as string of HTML
+     */
+    public function getDisplay(): string
+    {
+        $this->isDisplayed(true);
+
+        $context = 'primary';
+        $level = $this->getLevel();
+        if ($level === 'error') {
+            $context = 'danger';
+        }
+
+        $retval = '<div class="alert alert-' . $context . '" role="alert">';
+        if (! $this->isUserError()) {
+            $retval .= '<strong>' . $this->getType() . '</strong>';
+            $retval .= ' in ' . $this->getFile() . '#' . $this->getLine();
+            $retval .= "<br>\n";
+        }
+
+        $retval .= $this->getMessage();
+        if (! $this->isUserError()) {
+            $retval .= "<br>\n";
+            $retval .= "<br>\n";
+            $retval .= "<strong>Backtrace</strong><br>\n";
+            $retval .= "<br>\n";
+            $retval .= $this->getBacktraceDisplay();
+        }
+
+        $retval .= '</div>';
+
+        return $retval;
+    }
+
+    /**
+     * whether this error is a user error
+     */
+    public function isUserError(): bool
+    {
+        return $this->hideLocation ||
+            ($this->getNumber() & (E_USER_WARNING | E_USER_ERROR | E_USER_NOTICE | E_USER_DEPRECATED));
+    }
+
+    /**
+     * return short relative path to phpMyAdmin basedir
+     *
+     * prevent path disclosure in error message,
+     * and make users feel safe to submit error reports
+     *
+     * @param string $path path to be shorten
+     *
+     * @return string shortened path
+     */
+    public static function relPath(string $path): string
+    {
+        $dest = @realpath($path);
+
+        /* Probably affected by open_basedir */
+        if ($dest === false) {
+            return basename($path);
+        }
+
+        $hereParts = explode(
+            DIRECTORY_SEPARATOR,
+            (string) realpath(__DIR__ . DIRECTORY_SEPARATOR . '..' . DIRECTORY_SEPARATOR . '..')
+        );
+        $destParts = explode(DIRECTORY_SEPARATOR, $dest);
+
+        $result = '.';
+        while (implode(DIRECTORY_SEPARATOR, $destParts) != implode(DIRECTORY_SEPARATOR, $hereParts)) {
+            if (count($hereParts) > count($destParts)) {
+                array_pop($hereParts);
+                $result .= DIRECTORY_SEPARATOR . '..' . DIRECTORY_SEPARATOR . '..';
+            } else {
+                array_pop($destParts);
+            }
+        }
+
+        $path = $result . str_replace(implode(DIRECTORY_SEPARATOR, $destParts), '', $dest);
+
+        return str_replace(DIRECTORY_SEPARATOR . PATH_SEPARATOR, DIRECTORY_SEPARATOR, $path);
+    }
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               <?php
+
+declare(strict_types=1);
+
+namespace PhpMyAdmin;
+
+use function __;
+use function array_pop;
+use function count;
+use function htmlspecialchars;
+use function strlen;
+
+/**
+ * Index manipulation class
+ */
+class Index
+{
+    public const PRIMARY = 1;
+    public const UNIQUE = 2;
+    public const INDEX = 4;
+    public const SPATIAL = 8;
+    public const FULLTEXT = 16;
+
+    /**
+     * Class-wide storage container for indexes (caching, singleton)
+     *
+     * @var array
+     */
+    private static $registry = [];
+
+    /** @var string The name of the schema */
+    private $schema = '';
+
+    /** @var string The name of the table */
+    private $table = '';
+
+    /** @var string The name of the index */
+    private $name = '';
+
+    /**
+     * Columns in index
+     *
+     * @var array
+     */
+    private $columns = [];
+
+    /**
+     * The index method used (BTREE, HASH, RTREE).
+     *
+     * @var string
+     */
+    private $type = '';
+
+    /**
+     * The index choice (PRIMARY, UNIQUE, INDEX, SPATIAL, FULLTEXT)
+     *
+     * @var string
+     */
+    private $choice = '';
+
+    /**
+     * Various remarks.
+     *
+     * @var string
+     */
+    private $remarks = '';
+
+    /**
+     * Any comment provided for the index with a COMMENT attribute when the
+     * index was created.
+     *
+     * @var string
+     */
+    private $comment = '';
+
+    /** @var int 0 if the index cannot contain duplicates, 1 if it can. */
+    private $nonUnique = 0;
+
+    /**
+     * Indicates how the key is packed. NULL if it is not.
+     *
+     * @var string
+     */
+    private $packed = null;
+
+    /**
+     * Block size for the index
+     *
+     * @var int
+     */
+    private $keyBlockSize = null;
+
+    /**
+     * Parser option for the index
+     *
+     * @var string
+     */
+    private $parser = null;
+
+    /**
+     * @param array $params parameters
+     */
+    public function __construct(array $params = [])
+    {
+        $this->set($params);
+    }
+
+    /**
+     * Creates(if not already created) and returns the corresponding Index object
+     *
+     * @param string $schema     database name
+     * @param string $table      table name
+     * @param string $index_name index name
+     *
+     * @return Index corresponding Index object
+     */
+    public static function singleton($schema, $table, $index_name = '')
+    {
+        self::loadIndexes($table, $schema);
+        if (! isset(self::$registry[$schema][$table][$index_name])) {
+            $index = new Index();
+            if (strlen($index_name) > 0) {
+                $index->setName($index_name);
+                self::$registry[$schema][$table][$index->getName()] = $index;
+            }
+
+            return $index;
+        }
+
+        return self::$registry[$schema][$table][$index_name];
+    }
+
+    /**
+     * returns an array with all indexes from the given table
+     *
+     * @param string $table  table
+     * @param string $schema schema
+     *
+     * @return Index[]  array of indexes
+     */
+    public static function getFromTable($table, $schema)
+    {
+        self::loadIndexes($table, $schema);
+
+        if (isset(self::$registry[$schema][$table])) {
+            return self::$registry[$schema][$table];
+        }
+
+        return [];
+    }
+
+    /**
+     * Returns an array with all indexes from the given table of the requested types
+     *
+     * @param string $table   table
+     * @param string $schema  schema
+     * @param int    $choices choices
+     *
+     * @return Index[] array of indexes
+     */
+    public static function getFromTableByChoice($table, $schema, $choices = 31)
+    {
+        $indexes = [];
+        foreach (self::getFromTable($table, $schema) as $index) {
+            if (($choices & self::PRIMARY) && $index->getChoice() === 'PRIMARY') {
+                $indexes[] = $index;
+            }
+
+            if (($choices & self::UNIQUE) && $index->getChoice() === 'UNIQUE') {
+                $indexes[] = $index;
+            }
+
+            if (($choices & self::INDEX) && $index->getChoice() === 'INDEX') {
+                $indexes[] = $index;
+            }
+
+            if (($choices & self::SPATIAL) && $index->getChoice() === 'SPATIAL') {
+                $indexes[] = $index;
+            }
+
+            if ((! ($choices & self::FULLTEXT)) || $index->getChoice() !== 'FULLTEXT') {
+                continue;
+            }
+
+            $indexes[] = $index;
+        }
+
+        return $indexes;
+    }
+
+    /**
+     * return primary if set, false otherwise
+     *
+     * @param string $table  table
+     * @param string $schema schema
+     *
+     * @return Index|false primary index or false if no one exists
+     */
+    public static function getPrimary($table, $schema)
+    {
+        self::loadIndexes($table, $schema);
+
+        if (isset(self::$registry[$schema][$table]['PRIMARY'])) {
+            return self::$registry[$schema][$table]['PRIMARY'];
+        }
+
+        return false;
+    }
+
+    /**
+     * Load index data for table
+     *
+     * @param string $table  table
+     * @param string $schema schema
+     */
+    private static function loadIndexes($table, $schema): bool
+    {
+        global $dbi;
+
+        if (isset(self::$registry[$schema][$table])) {
+            return true;
+        }
+
+        $_raw_indexes = $dbi->getTableIndexes($schema, $table);
+        foreach ($_raw_indexes as $_each_index) {
+            $_each_index['Schema'] = $schema;
+            $keyName = $_each_index['Key_name'];
+            if (! isset(self::$registry[$schema][$table][$keyName])) {
+                $key = new Index($_each_index);
+                self::$registry[$schema][$table][$keyName] = $key;
+            } else {
+                $key = self::$registry[$schema][$table][$keyName];
+            }
+
+            $key->addColumn($_each_index);
+        }
+
+        return true;
+    }
+
+    /**
+     * Add column to index
+     *
+     * @param array $params column params
+     */
+    public function addColumn(array $params): void
+    {
+        $key = $params['Column_name'] ?? $params['Expression'] ?? '';
+        if (isset($params['Expression'])) {
+            // The Expression only does not make the key unique, add a sequence number
+            $key .= $params['Seq_in_index'];
+        }
+
+        if (strlen($key) <= 0) {
+            return;
+        }
+
+        $this->columns[$key] = new IndexColumn($params);
+    }
+
+    /**
+     * Adds a list of columns to the index
+     *
+     * @param array $columns array containing details about the columns
+     */
+    public function addColumns(array $columns): void
+    {
+        $_columns = [];
+
+        if (isset($columns['names'])) {
+            // coming from form
+            // $columns[names][]
+            // $columns[sub_parts][]
+            foreach ($columns['names'] as $key => $name) {
+                $sub_part = $columns['sub_parts'][$key] ?? '';
+                $_columns[] = [
+                    'Column_name' => $name,
+                    'Sub_part' => $sub_part,
+                ];
+            }
+        } else {
+            // coming from SHOW INDEXES
+            // $columns[][name]
+            // $columns[][sub_part]
+            // ...
+            $_columns = $columns;
+        }
+
+        foreach ($_columns as $column) {
+            $this->addColumn($column);
+        }
+    }
+
+    /**
+     * Returns true if $column indexed in this index
+     *
+     * @param string $column the column
+     */
+    public function hasColumn($column): bool
+    {
+        return isset($this->columns[$column]);
+    }
+
+    /**
+     * Sets index details
+     *
+     * @param array $params index details
+     */
+    public function set(array $params): void
+    {
+        if (isset($params['columns'])) {
+            $this->addColumns($params['columns']);
+        }
+
+        if (isset($params['Schema'])) {
+            $this->schema = $params['Schema'];
+        }
+
+        if (isset($params['Table'])) {
+            $this->table = $params['Table'];
+        }
+
+        if (isset($params['Key_name'])) {
+            $this->name = $params['Key_name'];
+        }
+
+        if (isset($params['Index_type'])) {
+            $this->type = $params['Index_type'];
+        }
+
+        if (isset($params['Comment'])) {
+            $this->remarks = $params['Comment'];
+        }
+
+        if (isset($params['Index_comment'])) {
+            $this->comment = $params['Index_comment'];
+        }
+
+        if (isset($params['Non_unique'])) {
+            $this->nonUnique = $params['Non_unique'];
+        }
+
+        if (isset($params['Packed'])) {
+            $this->packed = $params['Packed'];
+        }
+
+        if (isset($params['Index_choice'])) {
+            $this->choice = $params['Index_choice'];
+        } elseif ($this->name === 'PRIMARY') {
+            $this->choice = 'PRIMARY';
+        } elseif ($this->type === 'FULLTEXT') {
+            $this->choice = 'FULLTEXT';
+            $this->type = '';
+        } elseif ($this->type === 'SPATIAL') {
+            $this->choice = 'SPATIAL';
+            $this->type = '';
+        } elseif ($this->nonUnique == '0') {
+            $this->choice = 'UNIQUE';
+        } else {
+            $this->choice = 'INDEX';
+        }
+
+        if (isset($params['Key_block_size'])) {
+            $this->keyBlockSize = $params['Key_block_size'];
+        }
+
+        if (! isset($params['Parser'])) {
+            return;
+        }
+
+        $this->parser = $params['Parser'];
+    }
+
+    /**
+     * Returns the number of columns of the index
+     *
+     * @return int the number of the columns
+     */
+    public function getColumnCount()
+    {
+        return count($this->columns);
+    }
+
+    /**
+     * Returns the index comment
+     *
+     * @return string index comment
+     */
+    public function getComment()
+    {
+        return $this->comment;
+    }
+
+    /**
+     * Returns index remarks
+     *
+     * @return string index remarks
+     */
+    public function getRemarks()
+    {
+        return $this->remarks;
+    }
+
+    /**
+     * Return the key block size
+     *
+     * @return int
+     */
+    public function getKeyBlockSize()
+    {
+        return $this->keyBlockSize;
+    }
+
+    /**
+     * Return the parser
+     *
+     * @return string
+     */
+    public function getParser()
+    {
+        return $this->parser;
+    }
+
+    /**
+     * Returns concatenated remarks and comment
+     *
+     * @return string concatenated remarks and comment
+     */
+    public function getComments()
+    {
+        $comments = $this->getRemarks();
+        if (strlen($comments) > 0) {
+            $comments .= "\n";
+        }
+
+        $comments .= $this->getComment();
+
+        return $comments;
+    }
+
+    /**
+     * Returns index type (BTREE, HASH, RTREE)
+     *
+     * @return string index type
+     */
+    public function getType()
+    {
+        return $this->type;
+    }
+
+    /**
+     * Returns index choice (PRIMARY, UNIQUE, INDEX, SPATIAL, FULLTEXT)
+     *
+     * @return string index choice
+     */
+    public function getChoice()
+    {
+        return $this->choice;
+    }
+
+    /**
+     * Returns a lit of all index types
+     *
+     * @return string[] index types
+     */
+    public static function getIndexTypes()
+    {
+        return [
+            'BTREE',
+            'HASH',
+        ];
+    }
+
+    public function hasPrimary(): bool
+    {
+        return (bool) self::getPrimary($this->table, $this->schema);
+    }
+
+    /**
+     * Returns how the index is packed
+     *
+     * @return string how the index is packed
+     */
+    public function getPacked()
+    {
+        return $this->packed;
+    }
+
+    /**
+     * Returns 'No' if the index is not packed,
+     * how the index is packed if packed
+     *
+     * @return string
+     */
+    public function isPacked()
+    {
+        if ($this->packed === null) {
+            return __('No');
+        }
+
+        return htmlspecialchars($this->packed);
+    }
+
+    /**
+     * Returns integer 0 if the index cannot contain duplicates, 1 if it can
+     *
+     * @return int 0 if the index cannot contain duplicates, 1 if it can
+     */
+    public function getNonUnique()
+    {
+        return $this->nonUnique;
+    }
+
+    /**
+     * Returns whether the index is a 'Unique' index
+     *
+     * @param bool $as_text whether to output should be in text
+     *
+     * @return mixed whether the index is a 'Unique' index
+     */
+    public function isUnique($as_text = false)
+    {
+        if ($as_text) {
+            $r = [
+                '0' => __('Yes'),
+                '1' => __('No'),
+            ];
+        } else {
+            $r = [
+                '0' => true,
+                '1' => false,
+            ];
+        }
+
+        return $r[$this->nonUnique];
+    }
+
+    /**
+     * Returns the name of the index
+     *
+     * @return string the name of the index
+     */
+    public function getName()
+    {
+        return $this->name;
+    }
+
+    /**
+     * Sets the name of the index
+     *
+     * @param string $name index name
+     */
+    public function setName($name): void
+    {
+        $this->name = (string) $name;
+    }
+
+    /**
+     * Returns the columns of the index
+     *
+     * @return IndexColumn[] the columns of the index
+     */
+    public function getColumns()
+    {
+        return $this->columns;
+    }
+
+    /**
+     * Gets the properties in an array for comparison purposes
+     *
+     * @return array an array containing the properties of the index
+     */
+    public function getCompareData()
+    {
+        $data = [
+            'Packed' => $this->packed,
+            'Index_choice' => $this->choice,
+        ];
+
+        foreach ($this->columns as $column) {
+            $data['columns'][] = $column->getCompareData();
+        }
+
+        return $data;
+    }
+
+    /**
+     * Function to check over array of indexes and look for common problems
+     *
+     * @param string $table  table name
+     * @param string $schema schema name
+     *
+     * @return string  Output HTML
+     */
+    public static function findDuplicates($table, $schema)
+    {
+        $indexes = self::getFromTable($table, $schema);
+
+        $output = '';
+
+        // count($indexes) < 2:
+        //   there is no need to check if there less than two indexes
+        if (count($indexes) < 2) {
+            return $output;
+        }
+
+        // remove last index from stack and ...
+        while ($while_index = array_pop($indexes)) {
+            // ... compare with every remaining index in stack
+            foreach ($indexes as $each_index) {
+                if ($each_index->getCompareData() !== $while_index->getCompareData()) {
+                    continue;
+                }
+
+                // did not find any difference
+                // so it makes no sense to have this two equal indexes
+
+                $message = Message::notice(
+                    __(
+                        'The indexes %1$s and %2$s seem to be equal and one of them could possibly be removed.'
+                    )
+                );
+                $message->addParam($each_index->getName());
+                $message->addParam($while_index->getName());
+                $output .= $message->getDisplay();
+
+                // there is no need to check any further indexes if we have already
+                // found that this one has a duplicate
+                continue 2;
+            }
+        }
+
+        return $output;
+    }
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              <?php
+/**
+ * MySQL charset metadata and manipulations
+ */
+
+declare(strict_types=1);
+
+namespace PhpMyAdmin;
+
+use PhpMyAdmin\Charsets\Charset;
+use PhpMyAdmin\Charsets\Collation;
+
+use function __;
+use function array_keys;
+use function count;
+use function explode;
+use function is_string;
+use function ksort;
+
+use const SORT_STRING;
+
+/**
+ * Class used to manage MySQL charsets
+ */
+class Charsets
+{
+    /**
+     * MySQL charsets map
+     *
+     * @var array<string, string>
+     */
+    public static $mysqlCharsetMap = [
+        'big5' => 'big5',
+        'cp-866' => 'cp866',
+        'euc-jp' => 'ujis',
+        'euc-kr' => 'euckr',
+        'gb2312' => 'gb2312',
+        'gbk' => 'gbk',
+        'iso-8859-1' => 'latin1',
+        'iso-8859-2' => 'latin2',
+        'iso-8859-7' => 'greek',
+        'iso-8859-8' => 'hebrew',
+        'iso-8859-8-i' => 'hebrew',
+        'iso-8859-9' => 'latin5',
+        'iso-8859-13' => 'latin7',
+        'iso-8859-15' => 'latin1',
+        'koi8-r' => 'koi8r',
+        'shift_jis' => 'sjis',
+        'tis-620' => 'tis620',
+        'utf-8' => 'utf8',
+        'windows-1250' => 'cp1250',
+        'windows-1251' => 'cp1251',
+        'windows-1252' => 'latin1',
+        'windows-1256' => 'cp1256',
+        'windows-1257' => 'cp1257',
+    ];
+
+    /**
+     * The charset for the server
+     *
+     * @var Charset|null
+     */
+    private static $serverCharset = null;
+
+    /** @var array<string, Charset> */
+    private static $charsets = [];
+
+    /** @var array<string, array<string, Collation>> */
+    private static $collations = [];
+
+    /**
+     * Loads charset data from the server
+     *
+     * @param DatabaseInterface $dbi       DatabaseInterface instance
+     * @param bool              $disableIs Disable use of INFORMATION_SCHEMA
+     */
+    private static function loadCharsets(DatabaseInterface $dbi, bool $disableIs): void
+    {
+        /* Data already loaded */
+        if (count(self::$charsets) > 0) {
+            return;
+        }
+
+        $sql = 'SELECT `CHARACTER_SET_NAME` AS `Charset`,'
+            . ' `DEFAULT_COLLATE_NAME` AS `Default collation`,'
+            . ' `DESCRIPTION` AS `Description`,'
+            . ' `MAXLEN` AS `Maxlen`'
+            . ' FROM `information_schema`.`CHARACTER_SETS`';
+
+        if ($disableIs) {
+            $sql = 'SHOW CHARACTER SET';
+        }
+
+        $res = $dbi->query($sql);
+
+        self::$charsets = [];
+        foreach ($res as $row) {
+            self::$charsets[$row['Charset']] = Charset::fromServer($row);
+        }
+
+        ksort(self::$charsets, SORT_STRING);
+    }
+
+    /**
+     * Loads collation data from the server
+     *
+     * @param DatabaseInterface $dbi       DatabaseInterface instance
+     * @param bool              $disableIs Disable use of INFORMATION_SCHEMA
+     */
+    private static function loadCollations(DatabaseInterface $dbi, bool $disableIs): void
+    {
+        /* Data already loaded */
+        if (count(self::$collations) > 0) {
+            return;
+        }
+
+        $sql = 'SELECT `COLLATION_NAME` AS `Collation`,'
+            . ' `CHARACTER_SET_NAME` AS `Charset`,'
+            . ' `ID` AS `Id`,'
+            . ' `IS_DEFAULT` AS `Default`,'
+            . ' `IS_COMPILED` AS `Compiled`,'
+            . ' `SORTLEN` AS `Sortlen`'
+            . ' FROM `information_schema`.`COLLATIONS`';
+
+        if ($disableIs) {
+            $sql = 'SHOW COLLATION';
+        }
+
+        $res = $dbi->query($sql);
+
+        self::$collations = [];
+        foreach ($res as $row) {
+            self::$collations[$row['Charset']][$row['Collation']] = Collation::fromServer($row);
+        }
+
+        foreach (array_keys(self::$collations) as $charset) {
+            ksort(self::$collations[$charset], SORT_STRING);
+        }
+    }
+
+     /**
+      * Get current server charset
+      *
+      * @param DatabaseInterface $dbi       DatabaseInterface instance
+      * @param bool              $disableIs Disable use of INFORMATION_SCHEMA
+      */
+    public static function getServerCharset(DatabaseInterface $dbi, bool $disableIs): Charset
+    {
+        if (self::$serverCharset !== null) {
+            return self::$serverCharset;
+        }
+
+        self::loadCharsets($dbi, $disableIs);
+        $serverCharset = $dbi->getVariable('character_set_server');
+        if (! is_string($serverCharset)) {// MySQL 5.7.8 fallback, issue #15614
+            $serverCharset = $dbi->fetchValue('SELECT @@character_set_server;');
+        }
+
+        self::$serverCharset = self::$charsets[$serverCharset] ?? null;
+
+        // MySQL 8.0.11+ fallback, issue #16931
+        if (self::$serverCharset === null && $serverCharset === 'utf8mb3') {
+            // See: https://dev.mysql.com/doc/relnotes/mysql/8.0/en/news-8-0-11.html#mysqld-8-0-11-charset
+            // The utf8mb3 character set will be replaced by utf8mb4 in a future MySQL version.
+            // The utf8 character set is currently an alias for utf8mb3,
+            // but will at that point become a reference to utf8mb4.
+            // To avoid ambiguity about the meaning of utf8,
+            // consider specifying utf8mb4 explicitly for character set references instead of utf8.
+            // Warning: #3719 'utf8' is currently an alias for the character set UTF8MB3 [...]
+            return self::$charsets['utf8'];
+        }
+
+        if (self::$serverCharset === null) {// Fallback in case nothing is found
+            return Charset::fromServer(
+                [
+                    'Charset' => __('Unknown'),
+                    'Description' => __('Unknown'),
+                ]
+            );
+        }
+
+        return self::$serverCharset;
+    }
+
+    /**
+     * Get all server charsets
+     *
+     * @param DatabaseInterface $dbi       DatabaseInterface instance
+     * @param bool              $disableIs Disable use of INFORMATION_SCHEMA
+     *
+     * @return array<string, Charset>
+     */
+    public static function getCharsets(DatabaseInterface $dbi, bool $disable

@@ -1,0 +1,6 @@
+{
+    "require": {
+        "leafs/fetch": "^0.1.0",
+        "leafs/leaf": "^3.2"
+    }
+}

@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Drag and Drop Image Upload pharmabag</title>
+<style>
+    #drop-area {
+        border: 2px dashed #ccc;
+        border-radius: 20px;
+        padding: 20px;
+        text-align: center;
+        margin: 20px;
+        height:300px;
+    }
+    #drop-area.highlight {
+        border-color: purple;
+    }
+    #progress-bar {
+        width: 100%;
+        height: 30px;
+        background-color: #f0f0f0;
+        margin-top: 10px;
+    }
+    #progress-bar-fill {
+        height: 100%;
+        background-color: #4caf50;
+        transition: width 0.3s;
+    }
+  .tile {
+        background-color: #f9f9f9;
+        border: 1px solid #ddd;
+        border-radius: 5px;
+        padding: 10px;
+        margin-bottom: 10px;
+    }
+</style>
+</head>
+<body>
+
+<div id="drop-area" ondragover="handleDragOver(event)" ondragleave="handleDragLeave(event)" ondrop="handleDrop(event)">
+    <p>Drag and Drop Images Here</p>
+    <input type="file" id="fileInput" multiple style="" onchange="handleFiles(this.files)">
+</div>
+
+<div id="progress-bar">
+    <div id="progress-bar-fill" style="width: 0;"></div>
+</div>
+<div id="tiles-container"></div>
+<script>
+function handleDragOver(event) {
+    event.preventDefault();
+    event.stopPropagation();
+    event.dataTransfer.dropEffect = 'copy';
+    document.getElementById('drop-area').classList.add('highlight');
+}
+
+function handleDragLeave(event) {
+    event.preventDefault();
+    event.stopPropagation();
+    document.getElementById('drop-area').classList.remove('highlight');
+    document.getElementById("tiles-container").innerHTML='';
+}
+
+function handleDrop(event) {
+    event.preventDefault();
+    event.stopPropagation();
+    document.getElementById("tiles-container").innerHTML='';
+    document.getElementById('drop-area').classList.remove('highlight');
+    const files = event.dataTransfer.files;
+    handleFiles(files);
+}
+
+function handleFiles(files) {
+ document.getElementById("tiles-container").innerHTML='';
+    for (let i = 0; i < files.length; i++) {
+        uploadFile(files[i]);
+    }
+}
+function displayResponse(response) {
+    const tilesContainer = document.getElementById('tiles-container');
+    const tile = document.createElement('div');
+    var hhh= document.createElement("h3")
+    var cc=document.createElement("img");
+    cc.src=response.replace("https://pharmabag03.s3.ap-south-1.amazonaws.com/","https://pharmabag03.s3.ap-south-1.amazonaws.com/small_");
+    
+    tile.classList.add('tile');
+    hhh.textContent = response;
+    tilesContainer.appendChild(tile);
+    tile.appendChild(cc);
+    tile.appendChild(hhh);
+}
+function uploadFile(file) {
+    const formData = new FormData();
+    formData.append('file', file);
+
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', '../upload.php'); // Replace 'upload.php' with your server-side script to handle uploads
+    xhr.upload.onprogress = function(event) {
+        if (event.lengthComputable) {
+            const percentComplete = (event.loaded / event.total) * 100;
+            document.getElementById('progress-bar-fill').style.width = percentComplete + '%';
+        }
+    };
+    xhr.onload = function() {
+        if (xhr.status === 200) {
+            console.log('Upload successful');
+displayResponse("https://"+xhr.responseText.split("https://")[1]);
+        } else {
+            console.error('Upload failed');
+        }
+    };
+    xhr.onerror = function() {
+        console.error('Error occurred during upload');
+    };
+    xhr.send(formData);
+}
+</script>
+
+</body>
+</html>
